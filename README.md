@@ -13,6 +13,7 @@ A centralized OCI backup automation tool inspired by **AWS Backup**. Automates b
 - [Authentication Setup](#authentication-setup)
 - [Installation](#installation)
 - [Tag-Driven Orchestration](#tag-driven-orchestration)
+- [Cross-Region Replication / DR](#cross-region-replication--dr)
 - [Commands](#commands)
   - [create-policy](#1-create-policy)
   - [assign-by-tag](#2-assign-by-tag)
@@ -23,6 +24,7 @@ A centralized OCI backup automation tool inspired by **AWS Backup**. Automates b
   - [monitor](#7-monitor)
   - [restore](#8-restore)
 - [Global Flags](#global-flags)
+- [Tagged Orchestration Flags](#tagged-orchestration-flags)
 - [Where to Find OCIDs](#where-to-find-ocids)
 - [OCI Services Used](#oci-services-used)
 - [Known Issues & Fixes](#known-issues--fixes)
@@ -50,13 +52,14 @@ New in v2:
 
 ## Supported Resources
 
-| Resource | Backup Type | Cross-Region Copy |
+| Resource | Backup Type | Cross-Region DR |
 |---|---|---|
-| Block Volumes | Policy-based (incremental + full) | ✅ |
-| Boot Volumes | Policy-based (incremental + full) | ✅ |
-| Object Storage Buckets | Object copy + lifecycle rules | ❌ (same-region) |
+| Block Volumes | Policy-based + tagged on-demand backup | ✅ (replication) |
+| Boot Volumes | Policy-based + tagged on-demand backup | ✅ (replication) |
+| Object Storage Buckets | Object copy + lifecycle rules | ✅ (initial DR copy + replication policy) |
 | Autonomous Database | On-demand full backup | ❌ |
-| MySQL HeatWave | On-demand full backup | ❌ |
+| MySQL HeatWave | On-demand full backup | ✅ (backup copy DR) |
+| PostgreSQL DB Systems | On-demand full backup | ✅ (backup copy DR) |
 
 ---
 
@@ -65,12 +68,12 @@ New in v2:
 | AWS Backup Feature | OCI Equivalent in This Script |
 |---|---|
 | Backup Plans | `create-policy` → OCI `VolumeBackupPolicy` |
-| Tag-based resource assignment | `assign-by-tag` → freeform tag discovery |
-| Cross-region copy | `copy-cross-region` → OCI Volume Backup Copy API |
+| Tag-based resource assignment | `list-tagged-resources` / `run-tagged-backups` → OCI defined tag discovery using `Operations.backup=enabled` |
+| Cross-region copy / DR | `run-tagged-backups --enable-dr` → per-service `dr_config` and `initial_dr_copy` actions |
 | Lifecycle (warm → cold) | Object Storage lifecycle rule (Standard → Archive) |
 | Activity monitoring + SNS alerts | `monitor` → polling loop + OCI Notifications (ONS) |
 | Restore jobs | `restore` → new volume from backup OCID |
-| Centralized backup console | `list-backups` → consolidated status table |
+| Centralized backup console | `list-backups` → consolidated status table across volumes and databases, including PostgreSQL |
 
 ---
 
@@ -148,6 +151,7 @@ Supported tag-driven discovery behavior:
 - Tagged `Bucket` -> copies objects to a deterministic backup bucket named `<source>-backup`
 - Tagged `AutonomousDatabase` -> triggers an on-demand Autonomous DB backup
 - Tagged `MySQL DB System` -> triggers an on-demand MySQL backup
+- Tagged `PostgreSQL DB System` -> triggers an on-demand PostgreSQL backup
 - Tagged `Instance` -> discovers attached boot and block volumes and backs those up
 
 ### Preview tagged resources
@@ -167,10 +171,14 @@ python3 oci_backup_manager.py run-tagged-backups \
   --compartment-id ocid1.compartment.oc1..xxxxxx \
   --include-subcompartments \
   --archive-after-days 90 \
-  --enable-cross-region-copy
+  --enable-dr \
+  --dr-region us-phoenix-1 \
+  --enable-mysql-read-replicas
 ```
 
-`run-tagged-backups` re-checks each resource's live lifecycle state immediately before the backup action. If a tagged resource is no longer eligible, it is skipped and reported as `skipped` instead of failing the whole run.
+`run-tagged-backups` re-checks each resource's live lifecycle state immediately before the backup action. If a tagged resource is no longer eligible, it is skipped and reported as `skipped` instead of failing the whole run. The preview and JSON output now show `planned_actions`, and run results show per-resource `actions` such as `backup`, `initial_dr_copy`, `dr_config`, and `mysql_read_replica`.
+
+For JSON output, `planned_actions` is the canonical field. `planned_action` is still included as a backward-compatible alias to the first planned action.
 
 ### Dry-run before making changes
 
@@ -193,6 +201,7 @@ Plan files can be JSON by default, or YAML if `pyyaml` is installed.
   "defaults": {
     "dest_region": "us-phoenix-1",
     "archive_after_days": 90,
+    "automatic_backup_retention_days": 7,
     "volume_policy": {
       "name": "oci-backup-manager-tagged-policy",
       "retention_days": 30,
@@ -211,12 +220,10 @@ Plan files can be JSON by default, or YAML if `pyyaml` is installed.
   },
   "services": {
     "block_volumes": {
-      "enabled": true,
-      "copy_to_region_enabled": true
+      "enabled": true
     },
     "boot_volumes": {
-      "enabled": true,
-      "copy_to_region_enabled": true
+      "enabled": true
     },
     "object_storage": {
       "enabled": true
@@ -226,6 +233,46 @@ Plan files can be JSON by default, or YAML if `pyyaml` is installed.
     },
     "mysql": {
       "enabled": true
+    },
+    "postgresql": {
+      "enabled": true
+    }
+  },
+  "dr": {
+    "enabled": true,
+    "target_region": "us-phoenix-1",
+    "block_volumes": {
+      "enabled": true,
+      "target_ad_strategy": "match_source_ordinal"
+    },
+    "boot_volumes": {
+      "enabled": true,
+      "target_ad_strategy": "match_source_ordinal"
+    },
+    "buckets": {
+      "enabled": true,
+      "destination_bucket_suffix": "-dr",
+      "seed_existing_objects_on_first_enablement": true
+    },
+    "mysql": {
+      "enabled": true,
+      "backup_copy_enabled": true,
+      "immediate_copy_new_manual_backup": true
+    },
+    "postgresql": {
+      "enabled": true,
+      "backup_copy_enabled": true,
+      "immediate_copy_new_manual_backup": true
+    }
+  },
+  "mysql_read_replicas": {
+    "enabled": true,
+    "replica_count": 1,
+    "overrides": {
+      "display_name_suffix": "-read-replica",
+      "shape_name": null,
+      "configuration_id": null,
+      "mysql_version": null
     }
   },
   "alerts": {
@@ -242,6 +289,93 @@ python3 oci_backup_manager.py run-plan \
   --plan backup-plan.json \
   --compartment-id ocid1.compartment.oc1..xxxxxx
 ```
+
+---
+
+## Cross-Region Replication / DR
+
+Use the following commands depending on the resource type and whether you want a one-off copy or ongoing DR configuration.
+
+### One-off volume backup copy
+
+Use `copy-cross-region` when you already have a block volume or boot volume backup OCID and want to copy that backup to another region.
+
+```bash
+# Block volume backup copy
+python3 oci_backup_manager.py copy-cross-region \
+  --backup-id ocid1.volumebackup.oc1..xxxxxx \
+  --resource-type block_volume \
+  --dest-region us-phoenix-1
+
+# Boot volume backup copy
+python3 oci_backup_manager.py copy-cross-region \
+  --backup-id ocid1.bootvolumebackup.oc1..xxxxxx \
+  --resource-type boot_volume \
+  --dest-region us-phoenix-1
+```
+
+### Tag-driven cross-region DR
+
+Use `run-tagged-backups --enable-dr` to discover tagged resources and configure the correct DR action for each supported resource type.
+
+```bash
+# Preview only
+python3 oci_backup_manager.py run-tagged-backups \
+  --compartment-id ocid1.compartment.oc1..xxxxxx \
+  --include-subcompartments \
+  --enable-dr \
+  --dr-region us-phoenix-1 \
+  --dry-run \
+  --output json
+
+# Execute DR actions
+python3 oci_backup_manager.py run-tagged-backups \
+  --compartment-id ocid1.compartment.oc1..xxxxxx \
+  --include-subcompartments \
+  --enable-dr \
+  --dr-region us-phoenix-1
+```
+
+When DR is enabled, the orchestration command performs service-specific actions such as:
+
+- Volume DR replication for tagged block and boot volumes
+- Initial cross-region object copy plus replication policy for tagged buckets
+- Immediate backup copy plus ongoing backup-copy policy for tagged MySQL and PostgreSQL systems
+
+### Plan-driven cross-region DR
+
+Use `run-plan` when you want the same DR behavior driven from a saved JSON or YAML plan file.
+
+```json
+{
+  "dr": {
+    "enabled": true,
+    "target_region": "us-phoenix-1"
+  }
+}
+```
+
+```bash
+# Preview only
+python3 oci_backup_manager.py run-plan \
+  --plan backup-plan.json \
+  --compartment-id ocid1.compartment.oc1..xxxxxx \
+  --dry-run
+
+# Execute DR actions
+python3 oci_backup_manager.py run-plan \
+  --plan backup-plan.json \
+  --compartment-id ocid1.compartment.oc1..xxxxxx
+```
+
+### Notes and limits
+
+- `copy-cross-region` supports only `block_volume` and `boot_volume`.
+- Buckets, MySQL, and PostgreSQL use `run-tagged-backups --enable-dr` or `run-plan` for cross-region DR.
+- `create-object-backup` creates a backup bucket copy, but it is not the dedicated cross-region DR command path.
+- `--enable-cross-region-copy` is still accepted as a deprecated alias for the volume DR flow.
+- `--enable-mysql-read-replicas` creates same-region MySQL read replicas, not cross-region replicas.
+- Autonomous Database backups do not have cross-region DR support in this tool.
 
 ---
 
@@ -306,7 +440,7 @@ oci bv volume update \
 
 ### 3. `list-backups`
 
-Prints a consolidated table of all backups across Block Volumes, Boot Volumes, Autonomous Databases, and MySQL HeatWave in a compartment.
+Prints a consolidated table of all backups across Block Volumes, Boot Volumes, Autonomous Databases, MySQL HeatWave, and PostgreSQL Database Systems in a compartment.
 
 ```bash
 python3 oci_backup_manager.py list-backups \
@@ -320,8 +454,9 @@ TYPE             STATE        SIZE(GB)   NAME                                   
 BlockVolume      AVAILABLE    50         prod-vol-backup-20260405                 2026-04-05 02:00:01+00:00
 BootVolume       AVAILABLE    100        prod-boot-backup-20260405                2026-04-05 02:00:05+00:00
 AutonomousDB     ACTIVE       N/A        manual-backup-20260405123000             2026-04-05 12:30:00+00:00
+PostgreSQL       ACTIVE       N/A        pg-backup-20260405134500                 2026-04-05 13:45:00+00:00
 
-Total: 3 backup(s) found.
+Total: 4 backup(s) found.
 ```
 
 | Argument | Required | Description |
@@ -370,6 +505,8 @@ python3 oci_backup_manager.py create-object-backup \
 
 The destination bucket is created automatically if it does not exist.
 
+For cross-region bucket DR, use `run-tagged-backups --enable-dr --dr-region <region>` or `run-plan` with DR enabled. Those flows seed the DR bucket and configure the replication policy.
+
 | Argument | Required | Description |
 |---|---|---|
 | `--namespace` | ✅ | OCI Object Storage namespace |
@@ -381,7 +518,7 @@ The destination bucket is created automatically if it does not exist.
 
 ### 6. `backup-database`
 
-Triggers an on-demand backup for an Autonomous Database or MySQL HeatWave DB system.
+Triggers an on-demand backup for an Autonomous Database, MySQL HeatWave DB system, or PostgreSQL Database System.
 
 ```bash
 # Autonomous DB
@@ -394,12 +531,19 @@ python3 oci_backup_manager.py backup-database \
 python3 oci_backup_manager.py backup-database \
   --db-id ocid1.mysqldbsystem.oc1..xxxxxx \
   --db-type mysql
+
+# PostgreSQL Database System
+python3 oci_backup_manager.py backup-database \
+  --db-id ocid1.postgresqldbsystem.oc1..xxxxxx \
+  --db-type postgresql
 ```
+
+For cross-region database DR, use `run-tagged-backups --enable-dr --dr-region <region>` or `run-plan` with DR enabled for MySQL and PostgreSQL. Autonomous Database currently supports backup creation only.
 
 | Argument | Required | Description |
 |---|---|---|
-| `--db-id` | ✅ | OCID of the DB system |
-| `--db-type` | ✅ | `autonomous` or `mysql` |
+| `--db-id` | ✅ | OCID of the database system or autonomous database |
+| `--db-type` | ✅ | `autonomous`, `mysql`, or `postgresql` |
 | `--display-name` | ❌ | Backup display name (auto-generated if omitted) |
 
 ---
@@ -474,6 +618,20 @@ These flags work with every command.
 
 ---
 
+## Tagged Orchestration Flags
+
+These flags apply to `run-tagged-backups` and the equivalent plan settings.
+
+| Flag | Description |
+|---|---|
+| `--enable-dr` | Enable cross-region DR configuration for tagged resources that support it |
+| `--dr-region REGION` | Destination region for DR replication or backup copy |
+| `--enable-mysql-read-replicas` | Create same-region MySQL read replicas for tagged MySQL DB systems |
+| `--mysql-replica-count N` | Number of MySQL read replicas to request per tagged MySQL DB system (default: `1`) |
+| `--enable-cross-region-copy` | Deprecated compatibility alias that maps to the new DR flow for block and boot volumes |
+
+---
+
 ## Where to Find OCIDs
 
 | Value | Where to find it |
@@ -483,6 +641,7 @@ These flags work with every command.
 | `backup-id` | OCI Console → Storage → Block Volume Backups |
 | `db-id` (Autonomous) | OCI Console → Oracle Database → Autonomous Databases |
 | `db-id` (MySQL) | OCI Console → Databases → MySQL HeatWave |
+| `db-id` (PostgreSQL) | OCI Console → Databases → PostgreSQL → Database systems |
 | `namespace` | OCI Console → Storage → Object Storage → any bucket detail page |
 | `topic-id` | OCI Console → Developer Services → Application Integration → Notifications |
 | `availability-domain` | OCI Console → any compute or storage resource detail page |
@@ -493,11 +652,14 @@ These flags work with every command.
 
 | OCI Service | SDK Client | Used For |
 |---|---|---|
-| Block Storage | `oci.core.BlockstorageClient` | Volume/boot volume backups, policies, restore |
+| Block Storage | `oci.core.BlockstorageClient` | Volume/boot volume backups, policies, restore, and DR replication |
 | Identity | `oci.identity.IdentityClient` | Listing Availability Domains |
-| Object Storage | `oci.object_storage.ObjectStorageClient` | Bucket backup and lifecycle rules |
+| Object Storage | `oci.object_storage.ObjectStorageClient` | Bucket backup, lifecycle rules, and replication policies |
 | Database | `oci.database.DatabaseClient` | Autonomous DB backups |
-| MySQL | `oci.mysql.DbBackupsClient`, `oci.mysql.DbSystemClient` | MySQL HeatWave backups |
+| MySQL | `oci.mysql.DbBackupsClient`, `oci.mysql.DbSystemClient` | MySQL HeatWave backups and DR backup-copy configuration |
+| MySQL Replicas | `oci.mysql.ReplicasClient` | Same-region MySQL read replicas |
+| PostgreSQL | `oci.psql.PostgresqlClient` | PostgreSQL DB system discovery, backups, DR backup-copy policy, and backup listing |
+| Virtual Network | `oci.core.VirtualNetworkClient` | MySQL read-replica subnet validation |
 | Notifications | `oci.ons.NotificationDataPlaneClient` | Failure alerts |
 
 ---

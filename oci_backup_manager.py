@@ -23,11 +23,13 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 try:
@@ -57,12 +59,18 @@ DEFAULT_TAG_VALUE = "enabled"
 DEFAULT_POLICY_NAME = "oci-backup-manager-tagged-policy"
 DEFAULT_OUTPUT = "table"
 SUPPORTED_OUTPUTS = ("table", "json")
+DEFAULT_DR_BUCKET_SUFFIX = "-dr"
+DEFAULT_MYSQL_REPLICA_SUFFIX = "-read-replica"
+DEFAULT_AUTOMATIC_BACKUP_RETENTION_DAYS = 7
+POSTGRESQL_WORK_REQUEST_TIMEOUT_SECONDS = 300
+POSTGRESQL_WORK_REQUEST_POLL_SECONDS = 5
 SUPPORTED_DISCOVERED_TYPES = {
     "BlockVolume",
     "BootVolume",
     "Bucket",
     "AutonomousDatabase",
     "MySQL",
+    "PostgreSQL",
     "Instance",
 }
 
@@ -83,6 +91,7 @@ class DiscoveredResource:
     region: str
     source_tag_path: str
     planned_action: str
+    planned_actions: List[str]
     is_direct_tag_match: bool
     derived_from_type: Optional[str] = None
     derived_from_id: Optional[str] = None
@@ -223,7 +232,7 @@ def normalize_name(resource: Any, fallback_prefix: str) -> str:
 def get_resource_lifecycle_state(resource: Any, resource_type: str) -> str:
     if resource_type == "Bucket":
         return str(getattr(resource, "lifecycle_state", None) or "ACTIVE").upper()
-    if resource_type == "MySQL":
+    if resource_type in {"MySQL", "PostgreSQL"}:
         return str(getattr(resource, "lifecycle_state", None) or getattr(resource, "state", None) or "").upper()
     return str(getattr(resource, "lifecycle_state", None) or getattr(resource, "state", None) or "").upper()
 
@@ -235,6 +244,7 @@ def is_resource_backup_eligible(resource_type: str, lifecycle_state: str) -> boo
         "Bucket": {"ACTIVE"},
         "AutonomousDatabase": {"AVAILABLE"},
         "MySQL": {"ACTIVE"},
+        "PostgreSQL": {"ACTIVE"},
         "Instance": {"RUNNING", "STOPPED"},
     }
     return lifecycle_state in eligible_states.get(resource_type, set())
@@ -251,9 +261,58 @@ def build_skip_reason(resource_type: str, lifecycle_state: str, inclusion_type: 
         return f"{inclusion_type.capitalize()} AutonomousDatabase is in state {lifecycle_state}; backups require AVAILABLE."
     if resource_type == "MySQL":
         return f"{inclusion_type.capitalize()} MySQL is in state {lifecycle_state}; backups require ACTIVE."
+    if resource_type == "PostgreSQL":
+        return f"{inclusion_type.capitalize()} PostgreSQL is in state {lifecycle_state}; backups require ACTIVE."
     if resource_type == "Instance":
         return f"{inclusion_type.capitalize()} Instance is in state {lifecycle_state}; only RUNNING or STOPPED instances can expand attached storage."
     return f"{inclusion_type.capitalize()} {resource_type} is in unsupported state {lifecycle_state}."
+
+
+def first_or_none(values: Sequence[str]) -> str:
+    return values[0] if values else ""
+
+
+def aggregate_result_status(actions: Sequence[Dict[str, Any]]) -> str:
+    if not actions:
+        return "skipped"
+    statuses = [action["status"] for action in actions]
+    if any(status == "failed" for status in statuses):
+        return "failed"
+    if any(status == "succeeded" for status in statuses):
+        return "succeeded"
+    if any(status == "planned" for status in statuses):
+        return "planned"
+    if any(status == "source_only" for status in statuses):
+        return "source_only"
+    return "skipped"
+
+
+def aggregate_result_detail(actions: Sequence[Dict[str, Any]]) -> str:
+    if not actions:
+        return ""
+    parts = []
+    for action in actions:
+        detail = action.get("detail") or action.get("result_id") or ""
+        parts.append(f"{action['type']}={action['status']}" + (f"({detail})" if detail else ""))
+    return ", ".join(parts)
+
+
+def extract_ad_ordinal(availability_domain: Optional[str]) -> Optional[str]:
+    if not availability_domain:
+        return None
+    match = re.search(r"AD-(\d+)$", availability_domain)
+    return match.group(1) if match else None
+
+
+def find_matching_destination_ad(source_availability_domain: Optional[str], candidate_ads: Sequence[str]) -> Optional[str]:
+    ordinal = extract_ad_ordinal(source_availability_domain)
+    if not ordinal:
+        return None
+    suffix = f"AD-{ordinal}"
+    for availability_domain in candidate_ads:
+        if availability_domain.endswith(suffix):
+            return availability_domain
+    return None
 
 
 def get_object_storage_namespace(config: Dict[str, Any], signer: Any) -> str:
@@ -305,6 +364,7 @@ def build_discovery_item(
     source_tag_path: str,
     planned_action: str,
     is_direct_tag_match: bool,
+    planned_actions: Optional[List[str]] = None,
     derived_from_type: Optional[str] = None,
     derived_from_id: Optional[str] = None,
     availability_domain: Optional[str] = None,
@@ -322,6 +382,7 @@ def build_discovery_item(
         region=region,
         source_tag_path=source_tag_path,
         planned_action=planned_action,
+        planned_actions=planned_actions[:] if planned_actions else [planned_action],
         is_direct_tag_match=is_direct_tag_match,
         derived_from_type=derived_from_type,
         derived_from_id=derived_from_id,
@@ -348,6 +409,10 @@ def merge_discovered_items(existing: DiscoveredResource, incoming: DiscoveredRes
     existing.is_backup_eligible = existing.is_backup_eligible or incoming.is_backup_eligible
     if not existing.skip_reason and incoming.skip_reason:
         existing.skip_reason = incoming.skip_reason
+    for action in incoming.planned_actions:
+        if action not in existing.planned_actions:
+            existing.planned_actions.append(action)
+    existing.planned_action = first_or_none(existing.planned_actions)
     if incoming.source_tag_path and incoming.source_tag_path != existing.source_tag_path:
         existing.add_reason(f"Also matched via {incoming.source_tag_path}")
     for reason in incoming.inclusion_reasons:
@@ -398,6 +463,7 @@ def discover_tagged_resources(
     block_client = make_client(oci.core.BlockstorageClient, config, signer)
     db_client = make_client(oci.database.DatabaseClient, config, signer)
     mysql_client = make_client(oci.mysql.DbSystemClient, config, signer)
+    psql_client = make_client(oci.psql.PostgresqlClient, config, signer)
     os_client = make_client(oci.object_storage.ObjectStorageClient, config, signer)
     namespace_name = get_object_storage_namespace(config, signer)
 
@@ -429,7 +495,7 @@ def discover_tagged_resources(
                         compartment_id=compartment_id,
                         region=region,
                         source_tag_path=source_path,
-                        planned_action="create_block_volume_backup",
+                        planned_action="backup",
                         is_direct_tag_match=True,
                         lifecycle_state=lifecycle_state,
                         is_backup_eligible=is_eligible,
@@ -444,7 +510,7 @@ def discover_tagged_resources(
                         compartment_id=compartment_id,
                         region=region,
                         source_tag_path=source_path,
-                        planned_action="create_block_volume_backup",
+                        planned_action="backup",
                         is_direct_tag_match=True,
                         lifecycle_state=lifecycle_state,
                         is_backup_eligible=False,
@@ -472,7 +538,7 @@ def discover_tagged_resources(
                             compartment_id=compartment_id,
                             region=region,
                             source_tag_path=source_path,
-                            planned_action="create_boot_volume_backup",
+                            planned_action="backup",
                             is_direct_tag_match=True,
                             availability_domain=availability_domain,
                             lifecycle_state=lifecycle_state,
@@ -488,7 +554,7 @@ def discover_tagged_resources(
                             compartment_id=compartment_id,
                             region=region,
                             source_tag_path=source_path,
-                            planned_action="create_boot_volume_backup",
+                            planned_action="backup",
                             is_direct_tag_match=True,
                             availability_domain=availability_domain,
                             lifecycle_state=lifecycle_state,
@@ -515,7 +581,7 @@ def discover_tagged_resources(
                         compartment_id=compartment_id,
                         region=region,
                         source_tag_path=source_path,
-                        planned_action="create_autonomous_database_backup",
+                        planned_action="backup",
                         is_direct_tag_match=True,
                         lifecycle_state=lifecycle_state,
                         is_backup_eligible=is_eligible,
@@ -530,7 +596,7 @@ def discover_tagged_resources(
                         compartment_id=compartment_id,
                         region=region,
                         source_tag_path=source_path,
-                        planned_action="create_autonomous_database_backup",
+                        planned_action="backup",
                         is_direct_tag_match=True,
                         lifecycle_state=lifecycle_state,
                         is_backup_eligible=False,
@@ -556,7 +622,7 @@ def discover_tagged_resources(
                         compartment_id=compartment_id,
                         region=region,
                         source_tag_path=source_path,
-                        planned_action="create_mysql_backup",
+                        planned_action="backup",
                         is_direct_tag_match=True,
                         lifecycle_state=lifecycle_state,
                         is_backup_eligible=is_eligible,
@@ -571,7 +637,7 @@ def discover_tagged_resources(
                         compartment_id=compartment_id,
                         region=region,
                         source_tag_path=source_path,
-                        planned_action="create_mysql_backup",
+                        planned_action="backup",
                         is_direct_tag_match=True,
                         lifecycle_state=lifecycle_state,
                         is_backup_eligible=False,
@@ -599,7 +665,7 @@ def discover_tagged_resources(
                         compartment_id=compartment_id,
                         region=region,
                         source_tag_path=source_path,
-                        planned_action="create_object_storage_backup",
+                        planned_action="backup",
                         is_direct_tag_match=True,
                         lifecycle_state=lifecycle_state,
                         is_backup_eligible=is_eligible,
@@ -614,12 +680,49 @@ def discover_tagged_resources(
                         compartment_id=compartment_id,
                         region=region,
                         source_tag_path=source_path,
-                        planned_action="create_object_storage_backup",
+                        planned_action="backup",
                         is_direct_tag_match=True,
                         lifecycle_state=lifecycle_state,
                         is_backup_eligible=False,
                         skip_reason=build_skip_reason("Bucket", lifecycle_state, "direct"),
                         executable=False,
+                        reason=f"Directly tagged with {source_path}",
+                    )
+                )
+
+        postgresql_db_systems = list_all_results(
+            psql_client.list_db_systems,
+            compartment_id=compartment_id,
+        )
+        for db_system_summary in postgresql_db_systems:
+            try:
+                db_system = psql_client.get_db_system(db_system_summary.id).data
+            except Exception as exc:
+                log.warning(
+                    "Could not fetch PostgreSQL DB system details for %s during tag discovery: %s",
+                    getattr(db_system_summary, "id", "<unknown>"),
+                    exc,
+                )
+                db_system = db_system_summary
+
+            if resource_has_defined_tag(db_system, namespace, tag_key_name, tag_value):
+                lifecycle_state = get_resource_lifecycle_state(db_system, "PostgreSQL")
+                is_eligible = is_resource_backup_eligible("PostgreSQL", lifecycle_state)
+                target_fn = add_item if is_eligible else add_skipped_item
+                target_fn(
+                    build_discovery_item(
+                        resource_type="PostgreSQL",
+                        resource_id=db_system.id,
+                        display_name=normalize_name(db_system, "postgresql"),
+                        compartment_id=getattr(db_system, "compartment_id", compartment_id),
+                        region=region,
+                        source_tag_path=source_path,
+                        planned_action="backup",
+                        is_direct_tag_match=True,
+                        lifecycle_state=lifecycle_state,
+                        is_backup_eligible=is_eligible,
+                        skip_reason=None if is_eligible else build_skip_reason("PostgreSQL", lifecycle_state, "direct"),
+                        executable=is_eligible,
                         reason=f"Directly tagged with {source_path}",
                     )
                 )
@@ -639,7 +742,7 @@ def discover_tagged_resources(
                 compartment_id=compartment_id,
                 region=region,
                 source_tag_path=source_path,
-                planned_action="expand_attached_storage",
+                planned_action="source_only",
                 is_direct_tag_match=True,
                 availability_domain=getattr(instance, "availability_domain", None),
                 lifecycle_state=instance_lifecycle_state,
@@ -676,7 +779,7 @@ def discover_tagged_resources(
                     compartment_id=boot_volume.compartment_id,
                     region=region,
                     source_tag_path=source_path,
-                    planned_action="create_boot_volume_backup",
+                    planned_action="backup",
                     is_direct_tag_match=False,
                     derived_from_type="Instance",
                     derived_from_id=instance.id,
@@ -711,7 +814,7 @@ def discover_tagged_resources(
                     compartment_id=volume.compartment_id,
                     region=region,
                     source_tag_path=source_path,
-                    planned_action="create_block_volume_backup",
+                    planned_action="backup",
                     is_direct_tag_match=False,
                     derived_from_type="Instance",
                     derived_from_id=instance.id,
@@ -752,6 +855,45 @@ def group_resources(resources: Sequence[DiscoveredResource]) -> Dict[str, List[D
     return grouped
 
 
+def is_dr_enabled_for_resource(plan: Dict[str, Any], resource_type: str) -> bool:
+    dr_cfg = ensure_dict(plan.get("dr"), "dr")
+    if not parse_bool(dr_cfg.get("enabled"), False):
+        return False
+    mapping = {
+        "BlockVolume": "block_volumes",
+        "BootVolume": "boot_volumes",
+        "Bucket": "buckets",
+        "MySQL": "mysql",
+        "PostgreSQL": "postgresql",
+    }
+    service_key = mapping.get(resource_type)
+    if not service_key:
+        return False
+    return parse_bool(ensure_dict(dr_cfg.get(service_key), f"dr.{service_key}").get("enabled"), True)
+
+
+def build_planned_actions_for_resource(resource: DiscoveredResource, plan: Dict[str, Any]) -> List[str]:
+    if resource.resource_type == "Instance":
+        return ["source_only"]
+
+    actions = ["backup"]
+    if resource.resource_type in {"BlockVolume", "BootVolume", "Bucket", "MySQL", "PostgreSQL"} and is_dr_enabled_for_resource(plan, resource.resource_type):
+        if resource.resource_type in {"Bucket", "MySQL", "PostgreSQL"}:
+            actions.append("initial_dr_copy")
+        actions.append("dr_config")
+    if resource.resource_type == "MySQL" and parse_bool(ensure_dict(plan.get("mysql_read_replicas"), "mysql_read_replicas").get("enabled"), False):
+        actions.append("mysql_read_replica")
+    return actions
+
+
+def enrich_discovery_with_plan_actions(discovery: Dict[str, Any], plan: Dict[str, Any]) -> Dict[str, Any]:
+    for bucket in ("resources", "skipped_resources"):
+        for resource in discovery.get(bucket, []):
+            resource.planned_actions = build_planned_actions_for_resource(resource, plan)
+            resource.planned_action = first_or_none(resource.planned_actions)
+    return discovery
+
+
 def print_discovery_table(resources: Sequence[DiscoveredResource]) -> None:
     grouped = group_resources(resources)
     if not grouped:
@@ -760,15 +902,15 @@ def print_discovery_table(resources: Sequence[DiscoveredResource]) -> None:
 
     for resource_type in sorted(grouped):
         print(f"\n[{resource_type}]")
-        print(f"{'NAME':<32} {'STATE':<14} {'COMPARTMENT':<24} {'INCLUSION':<14} {'ACTION':<30}")
-        print("-" * 124)
+        print(f"{'NAME':<28} {'STATE':<14} {'COMPARTMENT':<22} {'INCLUSION':<10} {'ACTIONS'}")
+        print("-" * 132)
         for resource in grouped[resource_type]:
             inclusion = "direct" if resource.is_direct_tag_match else "derived"
-            action = resource.planned_action
-            name = resource.display_name[:30]
+            actions = ",".join(resource.planned_actions)
+            name = resource.display_name[:26]
             state = (resource.lifecycle_state or "UNKNOWN")[:12]
-            compartment = resource.compartment_id[:22]
-            print(f"{name:<32} {state:<14} {compartment:<24} {inclusion:<14} {action:<30}")
+            compartment = resource.compartment_id[:20]
+            print(f"{name:<28} {state:<14} {compartment:<22} {inclusion:<10} {actions}")
             for reason in resource.inclusion_reasons:
                 print(f"  reason: {reason}")
 
@@ -795,13 +937,13 @@ def print_run_results_table(results: Sequence[Dict[str, Any]]) -> None:
         print("No results to display.")
         return
 
-    print(f"\n{'TYPE':<20} {'STATUS':<12} {'NAME':<32} {'DETAIL'}")
-    print("-" * 118)
+    print(f"\n{'TYPE':<16} {'STATUS':<12} {'NAME':<28} {'ACTIONS'}")
+    print("-" * 132)
     for result in results:
-        detail = result.get("detail") or result.get("result_id") or ""
+        detail = aggregate_result_detail(result.get("actions", [])) or result.get("detail") or result.get("result_id") or ""
         print(
-            f"{result['resource_type']:<20} {result['status']:<12} "
-            f"{result['display_name'][:30]:<32} {detail}"
+            f"{result['resource_type']:<16} {result['status']:<12} "
+            f"{result['display_name'][:26]:<28} {detail}"
         )
 
 
@@ -1065,6 +1207,24 @@ def list_backups(config, signer, compartment_id: str):
     except Exception as exc:
         log.warning("Could not list MySQL backups: %s", exc)
 
+    try:
+        psql_client = make_client(oci.psql.PostgresqlClient, config, signer)
+        psql_backups = list_all_results(
+            psql_client.list_backups, compartment_id=compartment_id
+        )
+        for backup in psql_backups:
+            results.append({
+                "type": "PostgreSQL",
+                "name": normalize_name(backup, "postgresql-backup"),
+                "id": backup.id,
+                "state": get_resource_lifecycle_state(backup, "PostgreSQL"),
+                "size_gb": getattr(backup, "size_in_gbs", "N/A"),
+                "time_created": str(getattr(backup, "time_created", "")),
+                "source_id": getattr(backup, "db_system_id", ""),
+            })
+    except Exception as exc:
+        log.warning("Could not list PostgreSQL backups: %s", exc)
+
     print(f"\n{'TYPE':<16} {'STATE':<12} {'SIZE(GB)':<10} {'NAME':<40} {'CREATED':<28}")
     print("-" * 110)
     for row in results:
@@ -1197,7 +1357,333 @@ def backup_database(config, signer, db_id: str, db_type: str,
         log.info("MySQL backup triggered: %s (%s)", backup.display_name, backup.id)
         return backup
 
-    raise ValueError(f"Unsupported db_type: {db_type}. Use 'autonomous' or 'mysql'.")
+    if db_type == "postgresql":
+        psql_client = make_client(oci.psql.PostgresqlClient, config, signer)
+        db_system = psql_client.get_db_system(db_id).data
+        details = oci.psql.models.CreateBackupDetails(
+            compartment_id=getattr(db_system, "compartment_id", None),
+            db_system_id=db_id,
+            display_name=name,
+        )
+        response = psql_client.create_backup(details)
+        backup = getattr(response, "data", None)
+        if backup is None:
+            work_request_id = getattr(response, "headers", {}).get("opc-work-request-id")
+            backup = wait_for_postgresql_backup_resource(
+                psql_client=psql_client,
+                compartment_id=getattr(db_system, "compartment_id", None),
+                db_system_id=db_id,
+                display_name=name,
+                work_request_id=work_request_id,
+            )
+            if backup is None:
+                backup = SimpleNamespace(
+                    id=None,
+                    display_name=name,
+                    work_request_id=work_request_id,
+                    compartment_id=getattr(db_system, "compartment_id", None),
+                )
+        log.info(
+            "PostgreSQL backup triggered: %s (%s)",
+            normalize_name(backup, "postgresql-backup"),
+            getattr(backup, "id", None) or getattr(backup, "work_request_id", "unknown"),
+        )
+        return backup
+
+    raise ValueError(f"Unsupported db_type: {db_type}. Use 'autonomous', 'mysql', or 'postgresql'.")
+
+
+def get_destination_availability_domains(config: Dict[str, Any], signer: Any, region: str) -> List[str]:
+    identity_client = make_client(oci.identity.IdentityClient, config, signer, region=region)
+    tenancy_id = get_tenancy_id(config, signer)
+    return [ad.name for ad in identity_client.list_availability_domains(compartment_id=tenancy_id).data]
+
+
+def ensure_bucket_exists(config: Dict[str, Any], signer: Any, namespace: str, bucket_name: str,
+                         compartment_id: str, region: Optional[str] = None) -> None:
+    client = make_client(oci.object_storage.ObjectStorageClient, config, signer, region=region)
+    try:
+        client.get_bucket(namespace, bucket_name)
+        return
+    except oci.exceptions.ServiceError as exc:
+        if exc.status != 404:
+            raise
+    client.create_bucket(
+        namespace,
+        oci.object_storage.models.CreateBucketDetails(
+            name=bucket_name,
+            compartment_id=compartment_id,
+            storage_tier="Standard",
+            freeform_tags={"managed-by": "oci-backup-manager"},
+        ),
+    )
+
+
+def configure_bucket_replication(config: Dict[str, Any], signer: Any, namespace: str, source_bucket: str,
+                                 dest_bucket: str, dest_region: str) -> Dict[str, Any]:
+    client = make_client(oci.object_storage.ObjectStorageClient, config, signer)
+    for policy in get_bucket_replication_policies(config, signer, namespace, source_bucket):
+        if getattr(policy, "destination_bucket_name", None) == dest_bucket and getattr(policy, "destination_region_name", None) == dest_region:
+            return {"status": "skipped", "detail": "Replication policy already configured."}
+    details = oci.object_storage.models.CreateReplicationPolicyDetails(
+        name=f"{source_bucket}-to-{dest_region}",
+        destination_region_name=dest_region,
+        destination_bucket_name=dest_bucket,
+    )
+    policy = client.create_replication_policy(namespace, source_bucket, details).data
+    return {"status": "succeeded", "detail": "Replication policy created.", "result_id": getattr(policy, "id", None)}
+
+
+def get_bucket_replication_policies(config: Dict[str, Any], signer: Any, namespace: str, source_bucket: str) -> List[Any]:
+    client = make_client(oci.object_storage.ObjectStorageClient, config, signer)
+    try:
+        return client.list_replication_policies(namespace, source_bucket).data or []
+    except AttributeError:
+        return []
+
+
+def seed_bucket_initial_dr_copy(config: Dict[str, Any], signer: Any, namespace: str, source_bucket: str,
+                                dest_bucket: str, dest_region: str) -> Dict[str, Any]:
+    client = make_client(oci.object_storage.ObjectStorageClient, config, signer)
+    objects = list_all_results(
+        client.list_objects, namespace_name=namespace, bucket_name=source_bucket
+    ).objects or []
+    copied = 0
+    for obj in objects:
+        client.copy_object(
+            namespace,
+            source_bucket,
+            oci.object_storage.models.CopyObjectDetails(
+                source_object_name=obj.name,
+                destination_region=dest_region,
+                destination_namespace=namespace,
+                destination_bucket=dest_bucket,
+                destination_object_name=obj.name,
+            ),
+        )
+        copied += 1
+    return {"status": "succeeded", "detail": f"Seeded {copied} object(s) to DR bucket.", "result_id": dest_bucket}
+
+
+def configure_volume_dr_replication(config: Dict[str, Any], signer: Any, resource: DiscoveredResource,
+                                    target_region: str) -> Dict[str, Any]:
+    destination_ads = get_destination_availability_domains(config, signer, target_region)
+    target_ad = find_matching_destination_ad(resource.availability_domain, destination_ads)
+    if not target_ad:
+        return {"status": "skipped", "detail": "No matching destination availability domain for DR replication."}
+
+    block_client = make_client(oci.core.BlockstorageClient, config, signer)
+    replica_display_name = f"{resource.display_name}-{target_region}-replica"
+    if resource.resource_type == "BlockVolume":
+        details = oci.core.models.UpdateVolumeDetails(
+            block_volume_replicas=[
+                oci.core.models.BlockVolumeReplicaDetails(
+                    availability_domain=target_ad,
+                    display_name=replica_display_name,
+                )
+            ]
+        )
+        response = block_client.update_volume(resource.resource_id, details).data
+    else:
+        details = oci.core.models.UpdateBootVolumeDetails(
+            boot_volume_replicas=[
+                oci.core.models.BootVolumeReplicaDetails(
+                    availability_domain=target_ad,
+                    display_name=replica_display_name,
+                )
+            ]
+        )
+        response = block_client.update_boot_volume(resource.resource_id, details).data
+    return {"status": "succeeded", "detail": f"Replication configured in {target_ad}.", "result_id": getattr(response, "id", None)}
+
+
+def copy_mysql_backup_to_region(config: Dict[str, Any], signer: Any, backup: Any, dest_region: str,
+                                retention_days: int) -> Dict[str, Any]:
+    client = make_client(oci.mysql.DbBackupsClient, config, signer)
+    details = oci.mysql.models.CopyBackupDetails(
+        compartment_id=getattr(backup, "compartment_id", None),
+        source_backup_id=backup.id,
+        source_region=get_region(config, signer),
+        display_name=f"{normalize_name(backup, 'mysql-backup')}-{dest_region}",
+        backup_copy_retention_in_days=retention_days,
+    )
+    copied = client.copy_backup(details).data
+    return {"status": "succeeded", "detail": f"Backup copied to {dest_region}.", "result_id": getattr(copied, "id", None)}
+
+
+def configure_mysql_dr_backup_policy(config: Dict[str, Any], signer: Any, db_system_id: str,
+                                     dest_region: str, retention_days: int) -> Dict[str, Any]:
+    client = make_client(oci.mysql.DbSystemClient, config, signer)
+    db_system = client.get_db_system(db_system_id).data
+    existing_policy = getattr(db_system, "backup_policy", None)
+    backup_policy = oci.mysql.models.UpdateBackupPolicyDetails(
+        is_enabled=True,
+        soft_delete=getattr(existing_policy, "soft_delete", None),
+        retention_in_days=getattr(existing_policy, "retention_in_days", retention_days),
+        window_start_time=getattr(existing_policy, "window_start_time", None),
+        pitr_policy=getattr(existing_policy, "pitr_policy", None),
+        copy_policies=[
+            oci.mysql.models.CopyPolicy(
+                copy_to_region=dest_region,
+                backup_copy_retention_in_days=retention_days,
+            )
+        ],
+    )
+    updated = client.update_db_system(
+        db_system_id,
+        oci.mysql.models.UpdateDbSystemDetails(backup_policy=backup_policy),
+    ).data
+    return {"status": "succeeded", "detail": f"MySQL backup copy policy configured for {dest_region}.", "result_id": getattr(updated, "id", None)}
+
+
+def is_mysql_read_replica_supported(config: Dict[str, Any], signer: Any, db_system: Any) -> Optional[str]:
+    shape_name = str(getattr(db_system, "shape_name", "") or "")
+    if ".FREE" in shape_name.upper():
+        return "MySQL read replicas are not supported on Always Free shapes."
+
+    numeric_parts = [int(part) for part in re.findall(r"\.(\d+)(?:\.|$)", shape_name)]
+    if numeric_parts and max(numeric_parts) < 4 and "ECPU" not in shape_name.upper():
+        return "MySQL read replicas require at least 4 OCPUs or 8 ECPUs."
+
+    subnet_id = getattr(db_system, "subnet_id", None)
+    if subnet_id:
+        vcn_client = make_client(oci.core.VirtualNetworkClient, config, signer)
+        subnet = vcn_client.get_subnet(subnet_id).data
+        if getattr(subnet, "ipv6_cidr_block", None) or getattr(subnet, "ipv6cidr_blocks", None):
+            return "MySQL read replicas are not supported on IPv6-enabled subnets."
+    return None
+
+
+def create_mysql_read_replicas(config: Dict[str, Any], signer: Any, db_system_id: str, plan: Dict[str, Any]) -> Dict[str, Any]:
+    db_client = make_client(oci.mysql.DbSystemClient, config, signer)
+    replica_client = make_client(oci.mysql.ReplicasClient, config, signer)
+    db_system = db_client.get_db_system(db_system_id).data
+    unsupported_reason = is_mysql_read_replica_supported(config, signer, db_system)
+    if unsupported_reason:
+        return {"status": "skipped", "detail": unsupported_reason}
+
+    overrides_cfg = ensure_dict(plan["mysql_read_replicas"].get("overrides"), "mysql_read_replicas.overrides")
+    replica_count = int(plan["mysql_read_replicas"].get("replica_count", 1))
+    replica_ids: List[str] = []
+    base_name = normalize_name(db_system, "mysql")
+    suffix = overrides_cfg.get("display_name_suffix", DEFAULT_MYSQL_REPLICA_SUFFIX)
+    for index in range(replica_count):
+        display_name = f"{base_name}{suffix}"
+        if replica_count > 1:
+            display_name = f"{display_name}-{index + 1}"
+        replica_details = oci.mysql.models.CreateReplicaDetails(
+            db_system_id=db_system_id,
+            display_name=display_name,
+            replica_overrides=oci.mysql.models.ReplicaOverrides(
+                mysql_version=overrides_cfg.get("mysql_version"),
+                shape_name=overrides_cfg.get("shape_name"),
+                configuration_id=overrides_cfg.get("configuration_id"),
+            ),
+        )
+        replica = replica_client.create_replica(replica_details).data
+        replica_ids.append(str(getattr(replica, "id", "")))
+    return {
+        "status": "succeeded",
+        "detail": f"MySQL read replica requested ({replica_count}).",
+        "result_id": ",".join(replica_ids),
+    }
+
+
+def configure_postgresql_dr(config: Dict[str, Any], signer: Any, db_system_id: str, dest_region: str,
+                            retention_days: int) -> Dict[str, Any]:
+    client = make_client(oci.psql.PostgresqlClient, config, signer)
+    db_system = client.get_db_system(db_system_id).data
+    unsupported_reason = get_postgresql_dr_skip_reason(db_system)
+    if unsupported_reason:
+        return {"status": "skipped", "detail": unsupported_reason}
+
+    management_policy = getattr(db_system, "management_policy", None)
+    backup_policy = getattr(management_policy, "backup_policy", None)
+    backup_start = getattr(backup_policy, "backup_start", "02:00")
+    retention = getattr(backup_policy, "retention_days", retention_days)
+    maintenance_window_start = getattr(management_policy, "maintenance_window_start", None)
+    updated = client.update_db_system(
+        db_system_id,
+        oci.psql.models.UpdateDbSystemDetails(
+            management_policy=oci.psql.models.ManagementPolicyDetails(
+                maintenance_window_start=maintenance_window_start,
+                backup_policy=oci.psql.models.DailyBackupPolicy(
+                    kind="DAILY",
+                    backup_start=backup_start,
+                    retention_days=retention,
+                    copy_policy=oci.psql.models.BackupCopyPolicy(
+                        compartment_id=getattr(db_system, "compartment_id", None),
+                        retention_period=retention,
+                        regions=[dest_region],
+                    ),
+                ),
+            ),
+        ),
+    ).data
+    return {"status": "succeeded", "detail": f"PostgreSQL backup copy policy configured for {dest_region}.", "result_id": getattr(updated, "id", None)}
+
+
+def get_postgresql_dr_skip_reason(db_system: Any) -> Optional[str]:
+    storage_details = getattr(db_system, "storage_details", None)
+    data_storage_type = str(
+        getattr(storage_details, "data_storage_type", "") or getattr(db_system, "data_storage_type", "") or ""
+    ).upper()
+    if data_storage_type and "REGIONAL" in data_storage_type:
+        return "PostgreSQL backup copy DR requires availability-domain-specific data placement."
+    return None
+
+
+def copy_postgresql_backup_to_region(config: Dict[str, Any], signer: Any, backup: Any, dest_region: str,
+                                     retention_days: int) -> Dict[str, Any]:
+    client = make_client(oci.psql.PostgresqlClient, config, signer)
+    response = client.backup_copy(
+        backup.id,
+        oci.psql.models.BackupCopyDetails(
+            compartment_id=getattr(backup, "compartment_id", None),
+            retention_period=retention_days,
+            regions=[dest_region],
+        ),
+    )
+    return {"status": "succeeded", "detail": f"Backup copied to {dest_region}.", "result_id": getattr(response, "opc_request_id", None)}
+
+
+def wait_for_postgresql_backup_resource(
+    psql_client: Any,
+    compartment_id: str,
+    db_system_id: str,
+    display_name: str,
+    work_request_id: Optional[str],
+    timeout_seconds: int = POSTGRESQL_WORK_REQUEST_TIMEOUT_SECONDS,
+    poll_seconds: int = POSTGRESQL_WORK_REQUEST_POLL_SECONDS,
+) -> Optional[Any]:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if work_request_id:
+            work_request = psql_client.get_work_request(work_request_id).data
+            work_request_status = str(getattr(work_request, "status", "") or "").upper()
+            if work_request_status in {"FAILED", "CANCELED"}:
+                raise RuntimeError(f"PostgreSQL backup work request {work_request_id} finished with status {work_request_status}.")
+
+        backups = list_all_results(
+            psql_client.list_backups,
+            compartment_id=compartment_id,
+            id=db_system_id,
+            display_name=display_name,
+        )
+        if backups:
+            backup_summary = sorted(
+                backups,
+                key=lambda item: str(getattr(item, "time_created", "") or ""),
+                reverse=True,
+            )[0]
+            try:
+                return psql_client.get_backup(backup_summary.id).data
+            except Exception:
+                return backup_summary
+
+        time.sleep(poll_seconds)
+
+    return None
 
 
 def monitor_backups(config, signer, compartment_id: str,
@@ -1300,6 +1786,7 @@ def default_plan_dict() -> Dict[str, Any]:
         "defaults": {
             "dest_region": CROSS_REGION,
             "archive_after_days": ARCHIVE_AFTER_DAYS,
+            "automatic_backup_retention_days": DEFAULT_AUTOMATIC_BACKUP_RETENTION_DAYS,
             "volume_policy": {
                 "name": DEFAULT_POLICY_NAME,
                 "retention_days": DEFAULT_RETENTION_DAYS,
@@ -1322,11 +1809,9 @@ def default_plan_dict() -> Dict[str, Any]:
         "services": {
             "block_volumes": {
                 "enabled": True,
-                "copy_to_region_enabled": False,
             },
             "boot_volumes": {
                 "enabled": True,
-                "copy_to_region_enabled": False,
             },
             "object_storage": {
                 "enabled": True,
@@ -1336,6 +1821,46 @@ def default_plan_dict() -> Dict[str, Any]:
             },
             "mysql": {
                 "enabled": True,
+            },
+            "postgresql": {
+                "enabled": True,
+            },
+        },
+        "dr": {
+            "enabled": False,
+            "target_region": CROSS_REGION,
+            "block_volumes": {
+                "enabled": True,
+                "target_ad_strategy": "match_source_ordinal",
+            },
+            "boot_volumes": {
+                "enabled": True,
+                "target_ad_strategy": "match_source_ordinal",
+            },
+            "buckets": {
+                "enabled": True,
+                "destination_bucket_suffix": DEFAULT_DR_BUCKET_SUFFIX,
+                "seed_existing_objects_on_first_enablement": True,
+            },
+            "mysql": {
+                "enabled": True,
+                "backup_copy_enabled": True,
+                "immediate_copy_new_manual_backup": True,
+            },
+            "postgresql": {
+                "enabled": True,
+                "backup_copy_enabled": True,
+                "immediate_copy_new_manual_backup": True,
+            },
+        },
+        "mysql_read_replicas": {
+            "enabled": False,
+            "replica_count": 1,
+            "overrides": {
+                "display_name_suffix": DEFAULT_MYSQL_REPLICA_SUFFIX,
+                "shape_name": None,
+                "configuration_id": None,
+                "mysql_version": None,
             },
         },
     }
@@ -1386,6 +1911,8 @@ def validate_and_normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     alerts = ensure_dict(merged.get("alerts"), "alerts")
     discovery = ensure_dict(merged.get("discovery"), "discovery")
     services = ensure_dict(merged.get("services"), "services")
+    dr = ensure_dict(merged.get("dr"), "dr")
+    mysql_read_replicas = ensure_dict(merged.get("mysql_read_replicas"), "mysql_read_replicas")
     volume_policy = ensure_dict(defaults.get("volume_policy"), "defaults.volume_policy")
     tag = ensure_dict(discovery.get("tag"), "discovery.tag")
 
@@ -1396,16 +1923,49 @@ def validate_and_normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
         if not str(tag.get(field_name, "")).strip():
             raise PlanValidationError(f"`discovery.tag.{field_name}` must be a non-empty string.")
 
-    for service_key in ("block_volumes", "boot_volumes", "object_storage", "autonomous_db", "mysql"):
+    for service_key in ("block_volumes", "boot_volumes", "object_storage", "autonomous_db", "mysql", "postgresql"):
         service_cfg = ensure_dict(services.get(service_key), f"services.{service_key}")
         service_cfg["enabled"] = parse_bool(service_cfg.get("enabled"), True)
         services[service_key] = service_cfg
+
+    legacy_volume_dr_enabled = any(
+        parse_bool(services[service_key].get("copy_to_region_enabled"), False)
+        for service_key in ("block_volumes", "boot_volumes")
+    )
+
+    dr["enabled"] = parse_bool(dr.get("enabled"), False)
+    dr["target_region"] = dr.get("target_region") or defaults.get("dest_region") or CROSS_REGION
+    for dr_key in ("block_volumes", "boot_volumes", "buckets", "mysql", "postgresql"):
+        dr_cfg = ensure_dict(dr.get(dr_key), f"dr.{dr_key}")
+        dr_cfg["enabled"] = parse_bool(dr_cfg.get("enabled"), True)
+        dr[dr_key] = dr_cfg
+    dr["buckets"]["destination_bucket_suffix"] = dr["buckets"].get("destination_bucket_suffix") or DEFAULT_DR_BUCKET_SUFFIX
+    dr["buckets"]["seed_existing_objects_on_first_enablement"] = parse_bool(
+        dr["buckets"].get("seed_existing_objects_on_first_enablement"), True
+    )
+    for db_key in ("mysql", "postgresql"):
+        dr[db_key]["backup_copy_enabled"] = parse_bool(dr[db_key].get("backup_copy_enabled"), True)
+        dr[db_key]["immediate_copy_new_manual_backup"] = parse_bool(dr[db_key].get("immediate_copy_new_manual_backup"), True)
+    if legacy_volume_dr_enabled:
+        dr["enabled"] = True
+        dr["block_volumes"]["enabled"] = True
+        dr["boot_volumes"]["enabled"] = True
+
+    mysql_read_replicas["enabled"] = parse_bool(mysql_read_replicas.get("enabled"), False)
+    mysql_read_replicas["replica_count"] = int(mysql_read_replicas.get("replica_count", 1))
+    mysql_read_replicas["overrides"] = ensure_dict(mysql_read_replicas.get("overrides"), "mysql_read_replicas.overrides")
+    mysql_read_replicas["overrides"]["display_name_suffix"] = (
+        mysql_read_replicas["overrides"].get("display_name_suffix") or DEFAULT_MYSQL_REPLICA_SUFFIX
+    )
 
     discovery["include_subcompartments"] = parse_bool(discovery.get("include_subcompartments"), False)
     discovery["expand_tagged_instances"] = parse_bool(discovery.get("expand_tagged_instances"), True)
 
     defaults["archive_after_days"] = int(defaults.get("archive_after_days", ARCHIVE_AFTER_DAYS))
     defaults["dest_region"] = defaults.get("dest_region") or CROSS_REGION
+    defaults["automatic_backup_retention_days"] = int(
+        defaults.get("automatic_backup_retention_days", DEFAULT_AUTOMATIC_BACKUP_RETENTION_DAYS)
+    )
     volume_policy["retention_days"] = int(volume_policy.get("retention_days", DEFAULT_RETENTION_DAYS))
     volume_policy["name"] = volume_policy.get("name") or DEFAULT_POLICY_NAME
     volume_policy["policy_id"] = volume_policy.get("policy_id")
@@ -1420,18 +1980,21 @@ def validate_and_normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     merged["alerts"] = alerts
     merged["discovery"] = discovery
     merged["services"] = services
+    merged["dr"] = dr
+    merged["mysql_read_replicas"] = mysql_read_replicas
 
     return merged
 
 
 def build_inline_plan_from_args(args: argparse.Namespace) -> Dict[str, Any]:
+    dr_enabled = args.enable_dr or args.enable_cross_region_copy
     return validate_and_normalize_plan({
         "auth": {
             "method": args.auth,
             "profile": args.profile,
         },
         "defaults": {
-            "dest_region": args.dest_region,
+            "dest_region": args.dr_region or args.dest_region,
             "archive_after_days": args.archive_after_days,
             "volume_policy": {
                 "name": args.policy_name,
@@ -1455,11 +2018,9 @@ def build_inline_plan_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         "services": {
             "block_volumes": {
                 "enabled": True,
-                "copy_to_region_enabled": args.enable_cross_region_copy,
             },
             "boot_volumes": {
                 "enabled": True,
-                "copy_to_region_enabled": args.enable_cross_region_copy,
             },
             "object_storage": {
                 "enabled": True,
@@ -1470,6 +2031,38 @@ def build_inline_plan_from_args(args: argparse.Namespace) -> Dict[str, Any]:
             "mysql": {
                 "enabled": True,
             },
+            "postgresql": {
+                "enabled": True,
+            },
+        },
+        "dr": {
+            "enabled": dr_enabled,
+            "target_region": args.dr_region or args.dest_region,
+            "block_volumes": {
+                "enabled": dr_enabled,
+                "target_ad_strategy": "match_source_ordinal",
+            },
+            "boot_volumes": {
+                "enabled": dr_enabled,
+                "target_ad_strategy": "match_source_ordinal",
+            },
+            "buckets": {
+                "enabled": args.enable_dr,
+            },
+            "mysql": {
+                "enabled": args.enable_dr,
+                "backup_copy_enabled": args.enable_dr,
+                "immediate_copy_new_manual_backup": args.enable_dr,
+            },
+            "postgresql": {
+                "enabled": args.enable_dr,
+                "backup_copy_enabled": args.enable_dr,
+                "immediate_copy_new_manual_backup": args.enable_dr,
+            },
+        },
+        "mysql_read_replicas": {
+            "enabled": args.enable_mysql_read_replicas,
+            "replica_count": args.mysql_replica_count,
         },
     })
 
@@ -1481,6 +2074,7 @@ def is_service_enabled(plan: Dict[str, Any], resource_type: str) -> bool:
         "Bucket": "object_storage",
         "AutonomousDatabase": "autonomous_db",
         "MySQL": "mysql",
+        "PostgreSQL": "postgresql",
         "Instance": None,
     }
     service_key = mapping.get(resource_type)
@@ -1505,6 +2099,9 @@ def fetch_live_resource(config: Dict[str, Any], signer: Any, resource: Discovere
         return client.get_autonomous_database(resource.resource_id).data
     if resource.resource_type == "MySQL":
         client = make_client(oci.mysql.DbSystemClient, config, signer)
+        return client.get_db_system(resource.resource_id).data
+    if resource.resource_type == "PostgreSQL":
+        client = make_client(oci.psql.PostgresqlClient, config, signer)
         return client.get_db_system(resource.resource_id).data
     if resource.resource_type == "Instance":
         client = make_client(oci.core.ComputeClient, config, signer)
@@ -1545,6 +2142,30 @@ def publish_run_notification(config: Dict[str, Any], signer: Any, topic_id: str,
     )
 
 
+def build_run_result(resource: DiscoveredResource) -> Dict[str, Any]:
+    return {
+        "resource_type": resource.resource_type,
+        "resource_id": resource.resource_id,
+        "display_name": resource.display_name,
+        "status": "pending",
+        "detail": "",
+        "lifecycle_state": resource.lifecycle_state,
+        "planned_action": resource.planned_action,
+        "planned_actions": list(resource.planned_actions),
+        "actions": [],
+    }
+
+
+def add_action_result(result: Dict[str, Any], action_type: str, status: str, detail: str = "",
+                      result_id: Optional[str] = None) -> None:
+    action = {"type": action_type, "status": status, "detail": detail}
+    if result_id:
+        action["result_id"] = result_id
+    result["actions"].append(action)
+    result["status"] = aggregate_result_status(result["actions"])
+    result["detail"] = aggregate_result_detail(result["actions"])
+
+
 def execute_tagged_backup_run(
     config: Dict[str, Any],
     signer: Any,
@@ -1562,14 +2183,10 @@ def execute_tagged_backup_run(
     namespace_name = None
 
     for resource in skipped_resources:
-        results.append({
-            "resource_type": resource.resource_type,
-            "resource_id": resource.resource_id,
-            "display_name": resource.display_name,
-            "status": "skipped",
-            "detail": resource.skip_reason or "Not backup eligible.",
-            "lifecycle_state": resource.lifecycle_state,
-        })
+        result = build_run_result(resource)
+        for action_name in resource.planned_actions or [resource.planned_action]:
+            add_action_result(result, action_name, "skipped", resource.skip_reason or "Not backup eligible.")
+        results.append(result)
 
     grouped = group_resources(resources)
     execution_order = [
@@ -1579,34 +2196,27 @@ def execute_tagged_backup_run(
         "Bucket",
         "AutonomousDatabase",
         "MySQL",
+        "PostgreSQL",
     ]
 
     for resource_type in execution_order:
         for resource in grouped.get(resource_type, []):
-            result = {
-                "resource_type": resource.resource_type,
-                "resource_id": resource.resource_id,
-                "display_name": resource.display_name,
-                "status": "pending",
-                "detail": "",
-                "lifecycle_state": resource.lifecycle_state,
-            }
+            result = build_run_result(resource)
 
             if resource.resource_type == "Instance":
-                result["status"] = "source_only"
-                result["detail"] = "Tagged instance used only to derive attached storage."
+                add_action_result(result, "source_only", "source_only", "Tagged instance used only to derive attached storage.")
                 results.append(result)
                 continue
 
             if not is_service_enabled(plan, resource.resource_type):
-                result["status"] = "skipped"
-                result["detail"] = "Service disabled in plan."
+                for action_name in resource.planned_actions:
+                    add_action_result(result, action_name, "skipped", "Service disabled in plan.")
                 results.append(result)
                 continue
 
             if dry_run:
-                result["status"] = "planned"
-                result["detail"] = resource.planned_action
+                for action_name in resource.planned_actions:
+                    add_action_result(result, action_name, "planned", "Dry run.")
                 results.append(result)
                 continue
 
@@ -1614,8 +2224,8 @@ def execute_tagged_backup_run(
                 resource = revalidate_resource_eligibility(config, signer, resource)
                 result["lifecycle_state"] = resource.lifecycle_state
                 if not resource.is_backup_eligible:
-                    result["status"] = "skipped"
-                    result["detail"] = resource.skip_reason or "Resource is no longer backup eligible."
+                    for action_name in resource.planned_actions:
+                        add_action_result(result, action_name, "skipped", resource.skip_reason or "Resource is no longer backup eligible.")
                     results.append(result)
                     continue
 
@@ -1632,7 +2242,6 @@ def execute_tagged_backup_run(
                         )
                         policy_cache[resource.compartment_id] = policy_id
                     assignment_status = assign_policy_to_asset(config, signer, resource.resource_id, policy_id)
-                    result["detail"] = f"policy={assignment_status}"
 
                     if resource.resource_type == "BlockVolume":
                         backup = create_block_volume_backup(
@@ -1641,16 +2250,15 @@ def execute_tagged_backup_run(
                             resource.resource_id,
                             display_name=f"{resource.display_name}-backup-{utc_timestamp()}",
                         )
-                        result["result_id"] = backup.id
-                        if plan["services"]["block_volumes"].get("copy_to_region_enabled"):
-                            copy = copy_backup_cross_region(
+                        add_action_result(result, "backup", "succeeded", f"policy={assignment_status}", backup.id)
+                        if is_dr_enabled_for_resource(plan, resource.resource_type):
+                            dr_result = configure_volume_dr_replication(
                                 config,
                                 signer,
-                                backup.id,
-                                resource_type="block_volume",
-                                dest_region=defaults["dest_region"],
+                                resource,
+                                plan["dr"]["target_region"],
                             )
-                            result["copy_id"] = copy.id
+                            add_action_result(result, "dr_config", dr_result["status"], dr_result["detail"], dr_result.get("result_id"))
                     else:
                         backup = create_boot_volume_backup(
                             config,
@@ -1658,18 +2266,15 @@ def execute_tagged_backup_run(
                             resource.resource_id,
                             display_name=f"{resource.display_name}-backup-{utc_timestamp()}",
                         )
-                        result["result_id"] = backup.id
-                        if plan["services"]["boot_volumes"].get("copy_to_region_enabled"):
-                            copy = copy_backup_cross_region(
+                        add_action_result(result, "backup", "succeeded", f"policy={assignment_status}", backup.id)
+                        if is_dr_enabled_for_resource(plan, resource.resource_type):
+                            dr_result = configure_volume_dr_replication(
                                 config,
                                 signer,
-                                backup.id,
-                                resource_type="boot_volume",
-                                dest_region=defaults["dest_region"],
+                                resource,
+                                plan["dr"]["target_region"],
                             )
-                            result["copy_id"] = copy.id
-
-                    result["status"] = "succeeded"
+                            add_action_result(result, "dr_config", dr_result["status"], dr_result["detail"], dr_result.get("result_id"))
 
                 elif resource.resource_type == "Bucket":
                     if namespace_name is None:
@@ -1684,9 +2289,38 @@ def execute_tagged_backup_run(
                         archive_after_days=defaults["archive_after_days"],
                         dest_compartment_id=resource.compartment_id,
                     )
-                    result["status"] = "succeeded"
-                    result["detail"] = f"copied_objects={copied_count}"
-                    result["result_id"] = dest_bucket
+                    add_action_result(result, "backup", "succeeded", f"copied_objects={copied_count}", dest_bucket)
+                    if is_dr_enabled_for_resource(plan, resource.resource_type):
+                        dr_region = plan["dr"]["target_region"]
+                        dr_bucket = f"{resource.display_name}{plan['dr']['buckets']['destination_bucket_suffix']}-{dr_region}"
+                        ensure_bucket_exists(config, signer, namespace_name, dr_bucket, resource.compartment_id, region=dr_region)
+                        existing_policies = get_bucket_replication_policies(config, signer, namespace_name, resource.display_name)
+                        matching_policy_exists = any(
+                            getattr(policy, "destination_bucket_name", None) == dr_bucket and
+                            getattr(policy, "destination_region_name", None) == dr_region
+                            for policy in existing_policies
+                        )
+                        if matching_policy_exists:
+                            add_action_result(result, "initial_dr_copy", "skipped", "DR bucket already seeded by existing replication policy.")
+                        elif parse_bool(plan["dr"]["buckets"].get("seed_existing_objects_on_first_enablement"), True):
+                            seed_result = seed_bucket_initial_dr_copy(
+                                config,
+                                signer,
+                                namespace_name,
+                                resource.display_name,
+                                dr_bucket,
+                                dr_region,
+                            )
+                            add_action_result(result, "initial_dr_copy", seed_result["status"], seed_result["detail"], seed_result.get("result_id"))
+                        dr_result = configure_bucket_replication(
+                            config,
+                            signer,
+                            namespace_name,
+                            resource.display_name,
+                            dr_bucket,
+                            dr_region,
+                        )
+                        add_action_result(result, "dr_config", dr_result["status"], dr_result["detail"], dr_result.get("result_id"))
 
                 elif resource.resource_type == "AutonomousDatabase":
                     backup = backup_database(
@@ -1696,8 +2330,7 @@ def execute_tagged_backup_run(
                         db_type="autonomous",
                         display_name=f"{resource.display_name}-backup-{utc_timestamp()}",
                     )
-                    result["status"] = "succeeded"
-                    result["result_id"] = backup.id
+                    add_action_result(result, "backup", "succeeded", "Autonomous DB backup created.", backup.id)
 
                 elif resource.resource_type == "MySQL":
                     backup = backup_database(
@@ -1707,17 +2340,82 @@ def execute_tagged_backup_run(
                         db_type="mysql",
                         display_name=f"{resource.display_name}-backup-{utc_timestamp()}",
                     )
-                    result["status"] = "succeeded"
-                    result["result_id"] = backup.id
+                    add_action_result(result, "backup", "succeeded", "MySQL backup created.", backup.id)
+                    if is_dr_enabled_for_resource(plan, resource.resource_type):
+                        if parse_bool(plan["dr"]["mysql"].get("immediate_copy_new_manual_backup"), True):
+                            copy_result = copy_mysql_backup_to_region(
+                                config,
+                                signer,
+                                backup,
+                                plan["dr"]["target_region"],
+                                defaults["automatic_backup_retention_days"],
+                            )
+                            add_action_result(result, "initial_dr_copy", copy_result["status"], copy_result["detail"], copy_result.get("result_id"))
+                        dr_result = configure_mysql_dr_backup_policy(
+                            config,
+                            signer,
+                            resource.resource_id,
+                            plan["dr"]["target_region"],
+                            defaults["automatic_backup_retention_days"],
+                        )
+                        add_action_result(result, "dr_config", dr_result["status"], dr_result["detail"], dr_result.get("result_id"))
+                    if parse_bool(plan["mysql_read_replicas"].get("enabled"), False):
+                        replica_result = create_mysql_read_replicas(config, signer, resource.resource_id, plan)
+                        add_action_result(result, "mysql_read_replica", replica_result["status"], replica_result["detail"], replica_result.get("result_id"))
+
+                elif resource.resource_type == "PostgreSQL":
+                    psql_live = fetch_live_resource(config, signer, resource)
+                    postgres_dr_skip_reason = get_postgresql_dr_skip_reason(psql_live)
+                    backup = backup_database(
+                        config,
+                        signer,
+                        resource.resource_id,
+                        db_type="postgresql",
+                        display_name=f"{resource.display_name}-backup-{utc_timestamp()}",
+                    )
+                    backup_result_id = getattr(backup, "id", None) or getattr(backup, "work_request_id", None)
+                    add_action_result(result, "backup", "succeeded", "PostgreSQL backup created.", backup_result_id)
+                    if is_dr_enabled_for_resource(plan, resource.resource_type):
+                        if postgres_dr_skip_reason:
+                            add_action_result(result, "initial_dr_copy", "skipped", postgres_dr_skip_reason)
+                            add_action_result(result, "dr_config", "skipped", postgres_dr_skip_reason)
+                        else:
+                            if parse_bool(plan["dr"]["postgresql"].get("immediate_copy_new_manual_backup"), True):
+                                if not getattr(backup, "id", None):
+                                    add_action_result(
+                                        result,
+                                        "initial_dr_copy",
+                                        "skipped",
+                                        "PostgreSQL backup copy skipped because the created backup OCID is not yet available.",
+                                    )
+                                else:
+                                    copy_result = copy_postgresql_backup_to_region(
+                                        config,
+                                        signer,
+                                        backup,
+                                        plan["dr"]["target_region"],
+                                        defaults["automatic_backup_retention_days"],
+                                    )
+                                    add_action_result(result, "initial_dr_copy", copy_result["status"], copy_result["detail"], copy_result.get("result_id"))
+                            dr_result = configure_postgresql_dr(
+                                config,
+                                signer,
+                                resource.resource_id,
+                                plan["dr"]["target_region"],
+                                defaults["automatic_backup_retention_days"],
+                            )
+                            add_action_result(result, "dr_config", dr_result["status"], dr_result["detail"], dr_result.get("result_id"))
 
                 else:
-                    result["status"] = "skipped"
-                    result["detail"] = f"Unsupported resource type: {resource.resource_type}"
+                    add_action_result(result, resource.planned_action or "backup", "skipped", f"Unsupported resource type: {resource.resource_type}")
 
             except Exception as exc:
                 failed = True
-                result["status"] = "failed"
-                result["detail"] = str(exc)
+                action_name = next(
+                    (action for action in resource.planned_actions if action not in {item["type"] for item in result["actions"]}),
+                    resource.planned_action or "backup",
+                )
+                add_action_result(result, action_name, "failed", str(exc))
 
             results.append(result)
 
@@ -1765,6 +2463,7 @@ def run_tagged_backup_flow(
         tag_value=tag_cfg["value"],
         expand_tagged_instances=discovery_cfg["expand_tagged_instances"],
     )
+    discovery = enrich_discovery_with_plan_actions(discovery, plan)
 
     if output == "json":
         preview = {
@@ -1809,6 +2508,7 @@ def run_list_tagged_resources(
         tag_value=DEFAULT_TAG_VALUE,
         expand_tagged_instances=True,
     )
+    discovery = enrich_discovery_with_plan_actions(discovery, default_plan_dict())
 
     payload = {
         **discovery,
@@ -1869,7 +2569,7 @@ def build_parser():
 
     p = sub.add_parser("backup-database", help="Trigger on-demand DB backup")
     p.add_argument("--db-id", required=True, help="OCID of the DB system")
-    p.add_argument("--db-type", required=True, choices=["autonomous", "mysql"])
+    p.add_argument("--db-type", required=True, choices=["autonomous", "mysql", "postgresql"])
     p.add_argument("--display-name")
 
     p = sub.add_parser("monitor", help="Monitor backup job status (polling loop)")
@@ -1900,7 +2600,11 @@ def build_parser():
     p.add_argument("--policy-id")
     p.add_argument("--policy-name", default=DEFAULT_POLICY_NAME)
     p.add_argument("--retention-days", type=int, default=DEFAULT_RETENTION_DAYS)
-    p.add_argument("--enable-cross-region-copy", action="store_true")
+    p.add_argument("--enable-cross-region-copy", action="store_true", help="Deprecated alias for volume DR enablement.")
+    p.add_argument("--enable-dr", action="store_true", help="Enable cross-region DR configuration for tagged resources that support it.")
+    p.add_argument("--dr-region", default=CROSS_REGION, help="Destination region for DR replication or backup copy.")
+    p.add_argument("--enable-mysql-read-replicas", action="store_true", help="Create same-region MySQL read replicas for tagged MySQL DB systems.")
+    p.add_argument("--mysql-replica-count", type=int, default=1)
 
     p = sub.add_parser("validate-plan", help="Validate a JSON or YAML backup plan file")
     p.add_argument("--plan", required=True)
